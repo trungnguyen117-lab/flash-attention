@@ -36,7 +36,6 @@ def _flash_attention_forward_swa_kernel(
     # 1. Calculate the number of query heads per group.
     # 2. Determine the correct kv_head_idx for the current q_head_idx.
     
-    kv_head_idx = 0    # Placeholder: Replace with your GQA calculation
     # 1. Calculate the number of query heads per group.
     num_groups = N_Q_HEADS // N_KV_HEADS
     # 2. Determine the correct kv_head_idx for the current q_head_idx.
@@ -63,15 +62,16 @@ def _flash_attention_forward_swa_kernel(
     # 1. Calculate the starting position of the attention window (window_start).
     # 2. Modify the range of the Phase 1 loop to start from your window_start.
 
-    window_start = 0 # Placeholder: Replace with your SWA calculation
-
     # 1. Calculate the starting position of the attention window (window_start).
     #    The oldest key any query in this tile may attend to is
     #    (first query position) - WINDOW_SIZE + 1, clamped at 0.
     #    Align it down to a multiple of BLOCK_N so the loop steps over whole K/V blocks.
+    #    Loop bounds are only responsible for COVERAGE; the per-element masks below
+    #    remove whatever the alignment pulled in from outside the window, so Phase 1
+    #    and Phase 2 never double count a key.
     first_q_pos = q_block_idx * BLOCK_M
-    window_start = tl.maximum(0, first_q_pos - WINDOW_SIZE + 1)
-    window_start = (window_start // BLOCK_N) * BLOCK_N
+    unaligned_window_start = tl.maximum(0, first_q_pos - WINDOW_SIZE + 1)
+    window_start = (unaligned_window_start // BLOCK_N) * BLOCK_N
 
     # --- Phase 1: Off-Diagonal Blocks (within the window) ---
     for start_n in range(window_start, q_block_idx * BLOCK_M, BLOCK_N):
