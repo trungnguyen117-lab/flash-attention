@@ -37,6 +37,10 @@ def _flash_attention_forward_swa_kernel(
     # 2. Determine the correct kv_head_idx for the current q_head_idx.
     
     kv_head_idx = 0    # Placeholder: Replace with your GQA calculation
+    # 1. Calculate the number of query heads per group.
+    num_groups = N_Q_HEADS // N_KV_HEADS
+    # 2. Determine the correct kv_head_idx for the current q_head_idx.
+    kv_head_idx = q_head_idx // num_groups
     # --- END OF GQA IMPLEMENTATION ---
 
 
@@ -61,18 +65,82 @@ def _flash_attention_forward_swa_kernel(
 
     window_start = 0 # Placeholder: Replace with your SWA calculation
 
+    # 1. Calculate the starting position of the attention window (window_start).
+    #    The oldest key any query in this tile may attend to is
+    #    (first query position) - WINDOW_SIZE + 1, clamped at 0.
+    #    Align it down to a multiple of BLOCK_N so the loop steps over whole K/V blocks.
+    first_q_pos = q_block_idx * BLOCK_M
+    window_start = tl.maximum(0, first_q_pos - WINDOW_SIZE + 1)
+    window_start = (window_start // BLOCK_N) * BLOCK_N
+
     # --- Phase 1: Off-Diagonal Blocks (within the window) ---
     for start_n in range(window_start, q_block_idx * BLOCK_M, BLOCK_N):
         # STUDENT IMPLEMENTATION REQUIRED (Part 3: SWA Logic)
         # Hint: You might need to apply the per-element sliding window mask to s_ij.
         #    - A score is invalid if `(query_offset - key_offset) >= WINDOW_SIZE`.
-        pass
+
+        # These blocks lie strictly before the diagonal, so only the window mask applies
+        # (the causal condition key_offset <= query_offset already holds for every pair).
+        # Because window_start is aligned down, the first block may contain keys that are
+        # already out of the window for every query in the tile; they are masked out here.
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+
+        # Sliding window mask: distance (query - key) must be < WINDOW_SIZE.
+        window_mask = (q_offsets[:, None] - k_offsets[None, :]) < WINDOW_SIZE
+        s_ij = tl.where(window_mask, s_ij, -float('inf'))
+
+        m_new = tl.maximum(m_i, tl.max(s_ij, axis=1))
+        alpha = tl.exp2(m_i - m_new)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+        acc = acc + tl.dot(p_ij.to(v_block.dtype), v_block)
+        l_i = l_i + tl.sum(p_ij, axis=1)
+        m_i = m_new
 
     # --- Phase 2: Diagonal Blocks ---
     diag_start = q_block_idx * BLOCK_M
     for start_n in range(diag_start, (q_block_idx + 1) * BLOCK_M, BLOCK_N):
         # STUDENT IMPLEMENTATION REQUIRED
-        pass
+
+        # The diagonal blocks must always be processed: they hold the most recent keys, which
+        # are inside the window even when WINDOW_SIZE is small enough that Phase 1 is empty.
+        # Both the causal and the sliding window masks apply here.
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+
+        # Causal AND sliding window.
+        diag_mask = (k_offsets[None, :] <= q_offsets[:, None]) & \
+                    ((q_offsets[:, None] - k_offsets[None, :]) < WINDOW_SIZE)
+        s_ij = tl.where(diag_mask, s_ij, -float('inf'))
+
+        m_new = tl.maximum(m_i, tl.max(s_ij, axis=1))
+        alpha = tl.exp2(m_i - m_new)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+        acc = acc + tl.dot(p_ij.to(v_block.dtype), v_block)
+        l_i = l_i + tl.sum(p_ij, axis=1)
+        m_i = m_new
     # --- END OF SWA IMPLEMENTATION ---
 
 

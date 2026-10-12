@@ -57,7 +57,106 @@ def _flash_attention_forward_swa_kernel(
     # 1. Phase 0: Sink blocks that are before the sliding window
     # 2. Phase 1: Off-Diagonal Blocks (within the window)
     # 3. Phase 2: Diagonal Blocks
-    pass
+
+    # The sliding window for this query tile always starts at
+    #   max(0, first_query_position - WINDOW_SIZE + 1)
+    # and everything before it splits into two disjoint regions:
+    #   [0, SINK_SIZE)          -> Phase 0 (attention sinks)
+    #   [SINK_SIZE, window_start) -> not attended to at all
+    first_q_pos = q_block_idx * BLOCK_M
+    window_start = tl.maximum(0, first_q_pos - WINDOW_SIZE + 1)
+
+    # ---------------------------------- Phase 0: sinks ----------------------------------
+    # The sink is a prefix of keys at absolute positions [0, SINK_SIZE). It is always visible
+    # to every query (it is not affected by the sliding window), so the only mask needed is the
+    # per-element `k_offsets < SINK_SIZE` bound - the last block is usually only partially full.
+    sink_end = ((SINK_SIZE + BLOCK_N - 1) // BLOCK_N) * BLOCK_N
+    for start_n in range(0, sink_end, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+
+        # Keep only the true sink keys inside the last (partial) block.
+        sink_mask = k_offsets[None, :] < SINK_SIZE
+        s_ij = tl.where(sink_mask, s_ij, -float('inf'))
+
+        m_new = tl.maximum(m_i, tl.max(s_ij, axis=1))
+        alpha = tl.exp2(m_i - m_new)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+        acc = acc + tl.dot(p_ij.to(v_block.dtype), v_block)
+        l_i = l_i + tl.sum(p_ij, axis=1)
+        m_i = m_new
+
+    # -------------------------- Phase 1: off-diagonal, in window --------------------------
+    # Keys in [SINK_SIZE, first_q_pos) that are also inside the window.
+    # Align the start down to a block boundary; any key that falls outside the window is
+    # removed by the per-element distance mask below.
+    phase1_start = tl.maximum(window_start, sink_end)
+    phase1_start = (phase1_start // BLOCK_N) * BLOCK_N
+
+    for start_n in range(phase1_start, first_q_pos, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+
+        # Sliding window mask (the causal condition already holds for these blocks).
+        window_mask = (q_offsets[:, None] - k_offsets[None, :]) < WINDOW_SIZE
+        s_ij = tl.where(window_mask, s_ij, -float('inf'))
+
+        m_new = tl.maximum(m_i, tl.max(s_ij, axis=1))
+        alpha = tl.exp2(m_i - m_new)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+        acc = acc + tl.dot(p_ij.to(v_block.dtype), v_block)
+        l_i = l_i + tl.sum(p_ij, axis=1)
+        m_i = m_new
+
+    # ---------------------------------- Phase 2: diagonal ----------------------------------
+    # The most recent keys, always inside the window. Both causal and window masks apply.
+    for start_n in range(first_q_pos, (q_block_idx + 1) * BLOCK_M, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+
+        diag_mask = (k_offsets[None, :] <= q_offsets[:, None]) & \
+                    ((q_offsets[:, None] - k_offsets[None, :]) < WINDOW_SIZE)
+        s_ij = tl.where(diag_mask, s_ij, -float('inf'))
+
+        m_new = tl.maximum(m_i, tl.max(s_ij, axis=1))
+        alpha = tl.exp2(m_i - m_new)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+        acc = acc + tl.dot(p_ij.to(v_block.dtype), v_block)
+        l_i = l_i + tl.sum(p_ij, axis=1)
+        m_i = m_new
     # --- END OF STUDENT IMPLEMENTATION ---
 
     # 4. Normalize and write the final output block.

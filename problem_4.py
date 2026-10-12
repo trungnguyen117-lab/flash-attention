@@ -54,7 +54,34 @@ def _flash_attention_forward_causal_kernel(
         # 1. Load the K and V blocks for the current iteration.
         # 2. Compute the attention scores (S_ij).
         # 3. Update the online softmax statistics (m_i, l_i) and the accumulator (acc).
-        pass
+
+        # 1. Load the K and V blocks for the current iteration.
+        #    K is loaded transposed (HEAD_DIM, BLOCK_N) so it can be fed straight to tl.dot.
+        #    Out-of-range keys get 0.0, which keeps the loads safe at the sequence tail.
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        # 2. Compute the attention scores (S_ij).
+        #    `s_ij = q @ k^T`, already scaled by softmax_scale * log2(e) so that exp2 == exp.
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+
+        # 3. Update the online softmax statistics (m_i, l_i) and the accumulator (acc).
+        #    These blocks are strictly in the past of every query in the tile, so no mask is needed.
+        m_new = tl.maximum(m_i, tl.max(s_ij, axis=1))
+        alpha = tl.exp2(m_i - m_new)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+        acc = acc + tl.dot(p_ij.to(v_block.dtype), v_block)
+        l_i = l_i + tl.sum(p_ij, axis=1)
+        m_i = m_new
         # --- END OF STUDENT IMPLEMENTATION ---
 
 
@@ -64,7 +91,36 @@ def _flash_attention_forward_causal_kernel(
     for start_n in range(diag_start, (q_block_idx + 1) * BLOCK_M, BLOCK_N):
         # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
         # Implement the logic for the diagonal blocks, apply the causal mask to S_ij.
-        pass
+
+        # Load K and V exactly as in Phase 1.
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+
+        # Apply the causal mask: query `q_offsets[i]` may attend to key `k_offsets[j]` only when
+        # k_offsets[j] <= q_offsets[i]. Masked entries are set to -inf so that exp2(...) == 0.
+        causal_mask = k_offsets[None, :] <= q_offsets[:, None]
+        s_ij = tl.where(causal_mask, s_ij, -float('inf'))
+
+        # Online softmax update, identical to Phase 1 but over the masked scores.
+        # A row whose mask is entirely false stays at -inf, so tl.maximum keeps the previous m_i
+        # and the row contributes nothing to this tile.
+        m_new = tl.maximum(m_i, tl.max(s_ij, axis=1))
+        alpha = tl.exp2(m_i - m_new)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+        acc = acc + tl.dot(p_ij.to(v_block.dtype), v_block)
+        l_i = l_i + tl.sum(p_ij, axis=1)
+        m_i = m_new
         # --- END OF STUDENT IMPLEMENTATION ---
 
 

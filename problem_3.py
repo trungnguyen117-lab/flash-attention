@@ -69,7 +69,34 @@ def _flash_attention_forward_kernel(
         # 4. Update the accumulator `acc` using `p_ij` and `v_block`.
         # 5. Update the denominator `l_i`.
         # 6. Update the running maximum `m_i` for the next iteration.
-        pass
+
+        # 1. Find the new running maximum (`m_new`).
+        #    `tl.max(..., axis=1)` reduces along the key dimension, giving one value per query row.
+        #    Scores for out-of-range keys are 0 after the masked load, which cannot beat a real
+        #    (finite) row maximum, and `tl.maximum` keeps `m_i` for rows that are still all -inf.
+        m_new = tl.maximum(m_i, tl.max(s_ij, axis=1))
+
+        # 2. Rescale the existing accumulator (`acc`) and denominator (`l_i`).
+        #    Both were computed with the old maximum, so they are corrected by exp(m_old - m_new).
+        #    On the first iteration m_old is -inf, so alpha is 0 and the (zero) accumulators are
+        #    discarded; that is exactly what we want.
+        alpha = tl.exp2(m_i - m_new)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha
+
+        # 3. Compute the attention probabilities for the current tile (`p_ij`).
+        #    `s_ij` was pre-scaled by `qk_scale = softmax_scale * log2(e)`, so exp2 gives exp.
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+
+        # 4. Update the accumulator `acc` using `p_ij` and `v_block`.
+        #    `p_ij` is cast to the dtype of V so the tensor cores can be used.
+        acc = acc + tl.dot(p_ij.to(v_block.dtype), v_block)
+
+        # 5. Update the denominator `l_i`.
+        l_i = l_i + tl.sum(p_ij, axis=1)
+
+        # 6. Update the running maximum `m_i` for the next iteration.
+        m_i = m_new
         # --- END OF STUDENT IMPLEMENTATION ---
 
 

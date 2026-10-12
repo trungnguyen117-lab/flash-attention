@@ -67,7 +67,48 @@ class FlashAttention2Function(torch.autograd.Function):
                         # 5. Accumulate the current tile's contribution to the accumulators to update l_i and o_i
                         #
                         # 6. Update the running max for the next iteration
-                        
+
+                        # 1. Apply causal masking if is_causal is True.
+                        #    A query at absolute position `q_pos` may only attend to keys with
+                        #    absolute position `k_pos <= q_pos`. Everything else is set to -inf so
+                        #    that exp(-inf - m) == 0 and the entry contributes nothing.
+                        #    The mask already covers the padding rows that the tile loops over
+                        #    (q_pos/k_pos beyond N_Q/N_K), so they are also excluded here.
+                        if is_causal:
+                            q_pos = torch.arange(q_start, q_end, device=Q.device).unsqueeze(1)   # (M, 1)
+                            k_pos = torch.arange(k_start, k_end, device=Q.device).unsqueeze(0)   # (1, N)
+                            causal_mask = k_pos <= q_pos                                         # (M, N)
+                            S_ij = S_ij.masked_fill(~causal_mask, float('-inf'))
+
+                        # 2. Compute the new running maximum.
+                        #    m_new = max(m_old, rowmax(S_ij)). Rowmax over an all -inf row (a query
+                        #    that has not seen any valid key yet) is -inf, and torch.maximum keeps
+                        #    the previous m_i, which is the desired behaviour.
+                        m_new = torch.maximum(m_i, S_ij.max(dim=-1).values)
+
+                        # 3. Rescale the previous accumulators (o_i, l_i) by exp(m_old - m_new).
+                        #    For the very first tile m_old == -inf: exp(-inf - m_new) == 0, which
+                        #    correctly discards the (zero) accumulators. The correction factor is
+                        #    computed in float32 and broadcast over the head dimension.
+                        correction = torch.exp(m_i - m_new)
+                        o_i = o_i * correction.unsqueeze(-1)
+                        l_i = l_i * correction
+
+                        # 4. Compute the probabilities for the current tile, P_tilde_ij = exp(S_ij - m_new).
+                        #    Masked entries are -inf so their exponential is exactly 0.
+                        #    The subtraction is done in float32 for numerical stability.
+                        P_tilde_ij = torch.exp(S_ij.to(torch.float32) - m_new.unsqueeze(-1))
+
+                        # 5. Accumulate the current tile's contribution to the accumulators.
+                        #    l_i accumulates the row sums of the probabilities and o_i accumulates
+                        #    P_tilde @ V. Matmul with a bf16/fp16 operand upcasts to float32, which
+                        #    matches the dtype of o_i.
+                        l_i = l_i + P_tilde_ij.sum(dim=-1)
+                        o_i = o_i + P_tilde_ij.to(V_tile.dtype) @ V_tile
+
+                        # 6. Update the running max for the next iteration.
+                        m_i = m_new
+
                         # --- END OF STUDENT IMPLEMENTATION ---
 
                     # After iterating through all key tiles, normalize the output
