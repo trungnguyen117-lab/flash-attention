@@ -100,6 +100,13 @@ def _flash_attention_forward_swa_kernel(
         s_ij = tl.where(window_mask, s_ij, -float('inf'))
 
         m_new = tl.maximum(m_i, tl.max(s_ij, axis=1))
+        # A row can be fully masked in the very first iteration of the tile (with
+        # W=128, rows 191..255 of the tile starting at q=128 have no valid key in
+        # the block k in [0,64)). Then m_new = max(-inf, -inf) = -inf and
+        # tl.exp2(m_i - m_new) = exp2(-inf - -inf) = exp2(nan) = nan, which poisons
+        # acc and l_i for the rest of the loop. Clamping makes alpha = exp2(-inf) = 0,
+        # so acc stays 0 and the row is picked up correctly by a later block.
+        m_new = tl.where(m_new == -float('inf'), 0.0, m_new)
         alpha = tl.exp2(m_i - m_new)
         acc = acc * alpha[:, None]
         l_i = l_i * alpha
@@ -134,6 +141,13 @@ def _flash_attention_forward_swa_kernel(
         s_ij = tl.where(diag_mask, s_ij, -float('inf'))
 
         m_new = tl.maximum(m_i, tl.max(s_ij, axis=1))
+        # A row can be fully masked in the very first iteration of the tile (with
+        # W=128, rows 191..255 of the tile starting at q=128 have no valid key in
+        # the block k in [0,64)). Then m_new = max(-inf, -inf) = -inf and
+        # tl.exp2(m_i - m_new) = exp2(-inf - -inf) = exp2(nan) = nan, which poisons
+        # acc and l_i for the rest of the loop. Clamping makes alpha = exp2(-inf) = 0,
+        # so acc stays 0 and the row is picked up correctly by a later block.
+        m_new = tl.where(m_new == -float('inf'), 0.0, m_new)
         alpha = tl.exp2(m_i - m_new)
         acc = acc * alpha[:, None]
         l_i = l_i * alpha
